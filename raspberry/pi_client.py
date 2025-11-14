@@ -1,223 +1,295 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Raspberry Pi WebSocket Client
-Connects to FastAPI backend and receives motor control commands
+WebSocket client for Raspberry Pi + DM556 (3 motors)
+- Clean shutdown on Ctrl+C
+- Auto-reconnect
+- Heartbeat (periodic status)
+- Commands (JSON): move, jog, stop, stop_all, pos, setpos
+- English-only I/O (no Spanish keys or messages)
 """
+
 import asyncio
-import websockets
 import json
-import logging
-from typing import Optional
+import os
+import signal
+import sys
+import time
+from typing import Optional, Dict
+from urllib.parse import urlparse
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+import websockets
+
+# --- Driver ---
+try:
+    from dm556 import DM556, MIN_FREQ, MAX_FREQ
+except Exception as e:
+    print("Failed to import DM556 driver:", e)
+    raise
+
+WS_URL = os.getenv("WS_URL")
+HEARTBEAT_INTERVAL = 10
+RECONNECT_DELAY = 3
 
 
-class RaspberryPiClient:
-    """WebSocket client for Raspberry Pi motor control"""
-    
-    def __init__(self, server_url: str):
-        """
-        Initialize Pi client
-        
-        Args:
-            server_url: WebSocket server URL (e.g., "ws://localhost:8000/ws/raspberry")
-        """
-        self.server_url = server_url
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
-        self.is_jogging = False
-        self.current_position = 0  # Mock position counter
-    
-    # ====================
-    # MOCK MOTOR FUNCTIONS - REPLACE THESE WITH YOUR ACTUAL MOTOR CONTROL CODE
-    # ====================
-    
-    def move_motor(self, pasos: int, frecuencia: int):
-        """
-        Mock function: Move motor with specified steps and frequency
-        
-        Args:
-            pasos: Number of steps to move
-            frecuencia: Frequency in Hz
-        
-        TODO: Replace this with your actual motor control code
-        """
-        logger.info(f"[MOCK] Moving motor: {pasos} steps at {frecuencia} Hz")
-        # Simulate position change
-        self.current_position += pasos
-        logger.info(f"[MOCK] New position: {self.current_position}")
-    
-    def jog_motor(self, frecuencia: int):
-        """
-        Mock function: Start continuous motor movement (jog) at specified frequency
-        
-        Args:
-            frecuencia: Frequency in Hz
-        
-        TODO: Replace this with your actual motor jog code
-        """
-        logger.info(f"[MOCK] Starting jog at {frecuencia} Hz")
-        self.is_jogging = True
-        # In real implementation, this would start continuous movement
-    
-    def stop_motor(self):
-        """
-        Mock function: Stop motor movement (stops jog)
-        
-        TODO: Replace this with your actual motor stop code
-        """
-        logger.info("[MOCK] Stopping motor")
-        self.is_jogging = False
-        # In real implementation, this would stop the motor
-    
-    def get_position(self) -> int:
-        """
-        Mock function: Get current motor position
-        
-        Returns:
-            Current position as integer
-        
-        TODO: Replace this with your actual position reading code
-        """
-        logger.info(f"[MOCK] Current position: {self.current_position}")
-        return self.current_position
-    
-    # ====================
-    # WebSocket Communication
-    # ====================
-    
-    async def handle_command(self, message: dict):
-        """
-        Handle incoming command from server
-        
-        Args:
-            message: Command message as dictionary
-        """
+def derive_origin(ws_url: str) -> str:
+    try:
+        u = urlparse(ws_url)
+        if not u.scheme or not u.netloc:
+            return ""
+        return f"https://{u.netloc}" if u.scheme == "wss" else f"http://{u.netloc}"
+    except Exception:
+        return ""
+
+
+class MotorWrapper:
+    def __init__(self, dir_pin: int, pul_pin: int):
+        self.m = DM556(dir_pin, pul_pin)
+        self._jog_task: Optional[asyncio.Task] = None
+        self._jog_running = asyncio.Event()
+        self._jog_freq = 0
+
+    def move(self, steps: int, freq: int):
+        self.stop()
+        f = max(MIN_FREQ, min(MAX_FREQ, int(freq)))
+        self.m.move(int(steps), f)
+
+    def start_jog(self, direction: str, freq: int):
+        cw = (direction or "").lower() in (
+            "cw", "right", "clockwise", "r", "1", "true", "t"
+        )
+        f = max(MIN_FREQ, min(MAX_FREQ, int(freq)))
+        self._jog_freq = f
+        self.m.set_dir(cw)
+
+        if self._jog_task and not self._jog_task.done():
+            self._jog_running.set()
+            return
+
+        self._jog_running.set()
+        self._jog_task = asyncio.create_task(self._jog_loop())
+
+    async def _jog_loop(self):
+        import lgpio
         try:
-            command_type = message.get("type")
-            
-            if command_type == "move":
-                pasos = message.get("pasos")
-                frecuencia = message.get("frecuencia")
-                
-                if pasos is None or frecuencia is None:
-                    logger.error("Move command missing parameters")
-                    await self.send_error("Move command requires 'pasos' and 'frecuencia'")
-                    return
-                
-                self.move_motor(int(pasos), int(frecuencia))
-                await self.send_response({
-                    "type": "move_complete",
-                    "pasos": pasos,
-                    "frecuencia": frecuencia
-                })
-            
-            elif command_type == "jog":
-                frecuencia = message.get("frecuencia")
-                
-                if frecuencia is None:
-                    logger.error("Jog command missing frequency")
-                    await self.send_error("Jog command requires 'frecuencia'")
-                    return
-                
-                self.jog_motor(int(frecuencia))
-                await self.send_response({
-                    "type": "jog_started",
-                    "frecuencia": frecuencia
-                })
-            
-            elif command_type == "stop":
-                self.stop_motor()
-                await self.send_response({
-                    "type": "motor_stopped"
-                })
-            
-            elif command_type == "pos":
-                position = self.get_position()
-                await self.send_response({
-                    "type": "position",
-                    "position": position
-                })
-            
-            else:
-                logger.warning(f"Unknown command type: {command_type}")
-                await self.send_error(f"Unknown command: {command_type}")
-        
-        except Exception as e:
-            logger.error(f"Error handling command: {e}")
-            await self.send_error(f"Error processing command: {str(e)}")
-    
-    async def send_response(self, message: dict):
-        """Send response back to server"""
-        if self.websocket:
+            lgpio.tx_pwm(self.m.h, self.m.pul, self._jog_freq, 50.0)
+            while self._jog_running.is_set():
+                await asyncio.sleep(0.2)
+        finally:
             try:
-                await self.websocket.send(json.dumps(message))
-                logger.info(f"Sent response: {message}")
-            except Exception as e:
-                logger.error(f"Error sending response: {e}")
-    
-    async def send_error(self, error_message: str):
-        """Send error message to server"""
-        await self.send_response({
-            "type": "error",
-            "message": error_message
-        })
-    
-    async def connect(self):
-        """Connect to WebSocket server and handle messages"""
-        retry_delay = 5  # seconds
-        
-        while True:
+                import lgpio
+                lgpio.tx_pwm(self.m.h, self.m.pul, 0, 0.0)
+            except Exception:
+                pass
+
+    def stop(self):
+        if self._jog_task and not self._jog_task.done():
+            self._jog_running.clear()
+
+    def position(self) -> int:
+        return int(self.m.pos)
+
+    def set_position(self, val: int):
+        self.m.pos = int(val)
+
+    def close(self):
+        self.stop()
+        try:
+            import lgpio
+            lgpio.tx_pwm(self.m.h, self.m.pul, 0, 0.0)
+        except Exception:
+            pass
+        try:
+            self.m.close()
+        except Exception:
+            pass
+
+
+def clamp_freq(value: int) -> int:
+    return max(MIN_FREQ, min(MAX_FREQ, int(value)))
+
+
+async def send_status(ws, motors: Dict[int, MotorWrapper], msg="alive"):
+    await ws.send(json.dumps({
+        "type": "status",
+        "pi_connected": True,
+        "message": msg,
+        "ts": time.time(),
+        "motors": {i: {"position": m.position()} for i, m in motors.items()}
+    }))
+
+
+async def heartbeat(ws, motors: Dict[int, MotorWrapper], stop_event: asyncio.Event):
+    while not stop_event.is_set():
+        try:
+            await send_status(ws, motors, "alive")
+        except Exception:
+            break
+        # Sleep with interruption check
+        try:
+            await asyncio.wait_for(stop_event.wait(), HEARTBEAT_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+
+
+def resolve_motor(motors: Dict[int, MotorWrapper], msg: dict) -> int:
+    mnum = int(msg.get("motor", 1))
+    if mnum not in motors:
+        raise ValueError(f"Invalid motor number: {mnum}. Valid range is 1..{len(motors)}.")
+    return mnum
+
+
+async def handle_message(ws, motors: Dict[int, MotorWrapper], msg: dict):
+    mtype = (msg.get("type") or "").lower()
+
+    async def send(obj):
+        await ws.send(json.dumps(obj))
+
+    try:
+        if mtype == "move":
+            mnum = resolve_motor(motors, msg)
+            steps = int(msg.get("steps", 0))
+            freq = clamp_freq(int(msg.get("frequency", MIN_FREQ)))
+            motors[mnum].move(steps, freq)
+            await send({"type": "move_complete", "motor": mnum, "steps": steps, "frequency": freq,
+                        "position": motors[mnum].position()})
+
+        elif mtype == "jog":
+            mnum = resolve_motor(motors, msg)
+            freq = clamp_freq(int(msg.get("frequency", MIN_FREQ)))
+            direction = (msg.get("direction") or "cw").lower()
+            if direction not in ("cw", "ccw", "right", "left", "clockwise", "counterclockwise"):
+                raise ValueError("direction must be one of: cw, ccw, right, left, clockwise, counterclockwise")
+            motors[mnum].start_jog(direction, freq)
+            await send({"type": "jog_started", "motor": mnum, "frequency": freq, "direction": direction})
+
+        elif mtype == "stop":
+            mnum = resolve_motor(motors, msg)
+            motors[mnum].stop()
+            await send({"type": "motor_stopped", "motor": mnum})
+
+        elif mtype == "stop_all":
+            for i, m in motors.items():
+                m.stop()
+            await send({"type": "all_motors_stopped"})
+
+        elif mtype == "pos":
+            mnum = resolve_motor(motors, msg)
+            await send({"type": "position", "motor": mnum, "position": motors[mnum].position()})
+
+        elif mtype == "setpos":
+            mnum = resolve_motor(motors, msg)
+            motors[mnum].set_position(int(msg.get("value", 0)))
+            await send({"type": "position", "motor": mnum, "position": motors[mnum].position()})
+
+        else:
+            await send({"type": "info", "message": "unknown command", "raw": msg})
+
+    except Exception as e:
+        await ws.send(json.dumps({"type": "error", "message": str(e)}))
+
+
+async def run_client():
+    import contextlib
+
+    motors: Dict[int, MotorWrapper] = {
+        1: MotorWrapper(dir_pin=26, pul_pin=19),
+        2: MotorWrapper(dir_pin=22, pul_pin=23),
+        3: MotorWrapper(dir_pin=24, pul_pin=25),
+    }
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _graceful(sig=None, frame=None):
+        print("\n[Pi] Ctrl+C received, shutting down gracefully…")
+        stop_event.set()
+        # Forcefully cancel all running tasks
+        for task in asyncio.all_tasks(loop):
+            if task is not asyncio.current_task():
+                task.cancel()
+
+    signal.signal(signal.SIGINT, _graceful)
+    signal.signal(signal.SIGTERM, _graceful)
+
+    origin = os.getenv("ORIGIN") or derive_origin(WS_URL)
+
+    try:
+        while not stop_event.is_set():
+            ws = None
+            hb = None
             try:
-                logger.info(f"Connecting to {self.server_url}...")
-                async with websockets.connect(self.server_url) as websocket:
-                    self.websocket = websocket
-                    logger.info("Connected to server successfully!")
-                    
-                    # Listen for messages
-                    async for message in websocket:
+                print(f"[Pi] Connecting to {WS_URL} …")
+                
+                # Add timeout to connection attempt
+                ws = await asyncio.wait_for(
+                    websockets.connect(
+                        WS_URL,
+                        ping_interval=None,
+                        origin=origin if origin else None,
+                    ),
+                    timeout=10.0
+                )
+                print("[Pi] Connected.")
+                await send_status(ws, motors, "Pi connected")
+
+                # Start heartbeat
+                hb = asyncio.create_task(heartbeat(ws, motors, stop_event))
+
+                # Main message loop with stop_event check
+                while not stop_event.is_set():
+                    try:
+                        # Use wait_for to make the receive interruptible
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                         try:
-                            data = json.loads(message)
-                            logger.info(f"Received: {data}")
-                            await self.handle_command(data)
-                        except json.JSONDecodeError as e:
-                            logger.error(f"Invalid JSON received: {e}")
+                            msg = json.loads(raw)
+                            await handle_message(ws, motors, msg)
                         except Exception as e:
-                            logger.error(f"Error processing message: {e}")
-            
-            except websockets.exceptions.WebSocketException as e:
-                logger.error(f"WebSocket error: {e}")
-            except Exception as e:
-                logger.error(f"Connection error: {e}")
-            
-            # Connection lost, attempt to reconnect
-            self.websocket = None
-            logger.info(f"Disconnected. Reconnecting in {retry_delay} seconds...")
-            await asyncio.sleep(retry_delay)
+                            await ws.send(json.dumps({"type": "error", "message": str(e)}))
+                    except asyncio.TimeoutError:
+                        # Timeout is expected, just continue to check stop_event
+                        continue
+                    except websockets.exceptions.ConnectionClosed:
+                        break
+                    except asyncio.CancelledError:
+                        break
 
+            except asyncio.TimeoutError:
+                print(f"[Pi] Connection timeout to {WS_URL}")
+            except (OSError, websockets.exceptions.ConnectionClosed) as e:
+                if not stop_event.is_set():
+                    print(f"[Pi] Connection error: {e}. Retrying in {RECONNECT_DELAY}s…")
+                    # Use wait_for to make sleep interruptible
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), RECONNECT_DELAY)
+                    except asyncio.TimeoutError:
+                        pass
+            except asyncio.CancelledError:
+                break
+            finally:
+                # Cancel heartbeat
+                if hb and not hb.done():
+                    hb.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await hb
+                # Close websocket
+                if ws is not None:
+                    await ws.close()
 
-async def main():
-    """Main entry point"""
-    # IMPORTANT: Change this URL to your Railway deployment URL
-    # Example: "wss://your-app.up.railway.app/ws/raspberry"
-    SERVER_URL = "ws://localhost:8000/ws/raspberry"
-    
-    # For production (Railway), use wss:// instead of ws://
-    # SERVER_URL = "wss://your-app.up.railway.app/ws/raspberry"
-    
-    logger.info("Starting Raspberry Pi WebSocket Client")
-    logger.info(f"Server URL: {SERVER_URL}")
-    logger.info("=" * 50)
-    
-    client = RaspberryPiClient(SERVER_URL)
-    await client.connect()
+        print("[Pi] Stop signal received, cleaning up…")
+
+    except asyncio.CancelledError:
+        print("\n[Pi] Task cancelled.")
+    finally:
+        for m in motors.values():
+            m.close()
+        print("[Pi] Program terminated.")
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        WS_URL = sys.argv[1]
     try:
-        asyncio.run(main())
+        asyncio.run(run_client())
     except KeyboardInterrupt:
-        logger.info("\nShutting down gracefully...")
+        print("\n[Pi] Manually interrupted.")

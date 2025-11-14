@@ -1,87 +1,124 @@
-# Raspberry Pi Motor Control via WebSocket# rasp-web
+# Raspberry Pi Motor Control via WebSocket
 
-A full-stack application for controlling Raspberry Pi motors remotely via WebSocket connections.
+# rasp-web
+
+A full-stack application for remotely controlling Raspberry Pi motors (DM556 drivers) using WebSockets.
 
 ## Architecture
 
-- **Frontend**: React + TypeScript + Vite
-- **Backend**: FastAPI + WebSockets
-- **Pi Client**: Python WebSocket client
-- **Deployment**: Railway (unified deployment)
+* **Frontend:** React + TypeScript + Vite
+* **Backend:** FastAPI + WebSockets
+* **Pi Client:** Python + WebSockets + DM556 driver
+* **Deployment:** Railway (backend + frontend together)
+
+---
+
+## Environment Variables (IMPORTANT)
+
+The Raspberry Pi client **no longer uses hardcoded URLs**.
+Instead, it reads environment variables:
+
+### **Required**
+
+| Variable | Used by             | Description                                                                                             |
+| -------- | ------------------- | ------------------------------------------------------------------------------------------------------- |
+| `WS_URL` | Raspberry Pi client | Full WebSocket URL to backend WebSocket endpoint. Example: `wss://your-app.up.railway.app/ws/raspberry` |
+
+### **Optional**
+
+| Variable | Used by             | Description                                                                               |
+| -------- | ------------------- | ----------------------------------------------------------------------------------------- |
+| `ORIGIN` | Raspberry Pi client | Explicit Origin header (optional). If not set, it is derived automatically from `WS_URL`. |
+
+You can set these on the Pi:
+
+```bash
+export WS_URL="wss://your-app.up.railway.app/ws/raspberry"
+export ORIGIN="https://your-app.up.railway.app"   # optional
+```
+
+Or run the client with an override:
+
+```bash
+python pi_client.py wss://your-app.up.railway.app/ws/raspberry
+```
+
+---
 
 ## Project Structure
 
 ```
 rasp-web/
 ├── backend/              # FastAPI backend
-│   ├── main.py          # Main FastAPI application
-│   ├── connection_manager.py  # WebSocket connection manager
+│   ├── main.py
+│   ├── connection_manager.py
 │   ├── requirements.txt
-│   ├── railway.json     # Railway deployment config
-│   └── static/          # Built React app (auto-generated)
-├── frontend/            # React frontend
+│   ├── railway.json
+│   └── static/           # Built React app (vite build)
+├── frontend/             # React frontend
 │   ├── src/
-│   │   ├── App.tsx
-│   │   ├── components/
-│   │   │   ├── ControlPanel.tsx
-│   │   │   └── StatusDisplay.tsx
-│   │   └── hooks/
-│   │       └── useWebSocket.ts
 │   ├── package.json
 │   └── vite.config.ts
-└── raspberry/           # Raspberry Pi client
+└── raspberry/            # Raspberry Pi WebSocket client
     ├── pi_client.py
+    ├── dm556.py
     └── requirements.txt
 ```
 
+---
+
 ## Features
 
-### Motor Commands
+### Motor Commands (via WebSocket)
 
-1. **Move**: Move motor with specified steps and frequency
-   - Parameters: `pasos` (steps), `frecuencia` (Hz)
+1. **Move**
 
-2. **Jog**: Continuous movement until stop
-   - Parameters: `frecuencia` (Hz)
-   - Requires explicit Stop command
+   * Parameters: `steps` (int), `frequency` (Hz)
 
-3. **Stop**: Stop motor movement (stops jog)
+2. **Jog (Continuous Move)**
 
-4. **Position**: Query current motor position
-   - Returns: Current position as integer
+   * Parameters: `direction`, `frequency`
+   * Runs until a Stop command or Ctrl+C on the Pi
+
+3. **Stop / Stop All**
+
+   * Stops jog/pulse generation
+
+4. **Position Query**
+
+   * Returns internal step counter
+
+---
 
 ## Local Development
 
-### Prerequisites
+### Requirements
 
-- Python 3.8+
-- Node.js 18+
-- npm or yarn
+* Python 3.8+
+* Node.js 18+
+* npm or yarn
 
-### Quick Start
+---
 
-Run the setup script to create virtual environments and install dependencies:
-
-```bash
-chmod +x setup.sh
-./setup.sh
-```
-
-### Manual Setup
-
-#### 1. Setup Backend
+## Backend Setup
 
 ```bash
 cd backend
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate
 pip install -r requirements.txt
 python main.py
 ```
 
-Backend runs on: `http://localhost:8000`
+Backend runs at:
 
-#### 2. Setup Frontend
+```
+http://localhost:8000
+```
+
+---
+
+## Frontend Setup
 
 ```bash
 cd frontend
@@ -89,9 +126,15 @@ npm install
 npm run dev
 ```
 
-Frontend runs on: `http://localhost:5173`
+Runs at:
 
-#### 3. Setup Raspberry Pi Client
+```
+http://localhost:5173
+```
+
+---
+
+## Raspberry Pi Client Setup
 
 On your Raspberry Pi:
 
@@ -100,172 +143,159 @@ cd raspberry
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-
-# Edit pi_client.py and update SERVER_URL to your backend URL
-# For local development: ws://YOUR_COMPUTER_IP:8000/ws/raspberry
-# For production: wss://your-app.up.railway.app/ws/raspberry
-
-python pi_client.py
 ```
 
-## Production Deployment
+### **Set the WebSocket URL using environment variables**
 
-### Deploy to Railway
-
-1. **Create Railway Account**
-   - Go to https://railway.app
-   - Sign up with GitHub
-
-2. **Create New Project**
-   - Click "New Project"
-   - Choose "Deploy from GitHub repo"
-   - Select your repository
-
-3. **Configure Deployment**
-   - Railway will auto-detect Python
-   - Set root directory: `backend`
-   - Start command (auto-configured via railway.json):
-     ```
-     uvicorn main:app --host 0.0.0.0 --port $PORT
-     ```
-
-4. **Build Frontend**
-   
-   Before deploying, build the frontend:
-   
-   ```bash
-   cd frontend
-   npm install
-   npm run build
-   ```
-   
-   This creates `backend/static/` with production files.
-
-5. **Push to GitHub**
-   
-   ```bash
-   git add .
-   git commit -m "Ready for deployment"
-   git push origin main
-   ```
-
-6. **Access Your App**
-   
-   Railway provides a URL like: `https://your-app.up.railway.app`
-
-### Update Raspberry Pi Client
-
-After deployment, update `raspberry/pi_client.py`:
-
-```python
-SERVER_URL = "wss://your-app.up.railway.app/ws/raspberry"
-```
-
-Run on your Pi:
+#### Local development example:
 
 ```bash
+export WS_URL="ws://192.168.0.50:8000/ws/raspberry"
 python pi_client.py
 ```
 
-## API Endpoints
+#### Production (Railway) example:
 
-### HTTP Endpoints
+```bash
+export WS_URL="wss://your-app.up.railway.app/ws/raspberry"
+python pi_client.py
+```
 
-- `GET /` - Serves React frontend
-- `GET /api/health` - Health check endpoint
+You may optionally specify `ORIGIN`:
 
-### WebSocket Endpoints
+```bash
+export ORIGIN="https://your-app.up.railway.app"
+```
 
-- `WS /ws/controller` - For React frontend connections
-- `WS /ws/raspberry` - For Raspberry Pi connection
+Or send the URL directly:
 
-### Message Format
+```bash
+python pi_client.py wss://your-app.up.railway.app/ws/raspberry
+```
 
-**Frontend → Backend → Pi:**
+---
+
+## Production Deployment (Railway)
+
+### 1. Deploy Backend + Frontend
+
+Before pushing:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+This outputs the production build to:
+
+```
+backend/static/
+```
+
+### 2. Push to GitHub and Deploy with Railway
+
+Railway automatically:
+
+* Installs backend dependencies
+* Runs FastAPI via `uvicorn`
+* Serves frontend from `/`
+
+### 3. Get Your Public URL
+
+Railway will give you a URL like:
+
+```
+https://your-app.up.railway.app
+```
+
+### 4. Set `WS_URL` on the Raspberry Pi
+
+```bash
+export WS_URL="wss://your-app.up.railway.app/ws/raspberry"
+```
+
+---
+
+## WebSocket Endpoints
+
+| Endpoint         | Purpose                       |
+| ---------------- | ----------------------------- |
+| `/ws/controller` | Frontend WebSocket            |
+| `/ws/raspberry`  | Raspberry Pi client WebSocket |
+
+---
+
+## Message Format
+
+### Frontend → Backend → Pi
+
 ```json
 {
   "type": "move",
-  "pasos": 100,
-  "frecuencia": 50
+  "motor": 1,
+  "steps": 1000,
+  "frequency": 1200
 }
 ```
 
-**Pi → Backend → Frontend:**
+### Pi → Backend → Frontend
+
 ```json
 {
   "type": "position",
-  "position": 1250
+  "motor": 1,
+  "position": 24500
 }
 ```
 
-## Motor Control Integration
-
-The Raspberry Pi client (`raspberry/pi_client.py`) contains mock motor functions. Replace these with your actual motor control code:
-
-```python
-def move_motor(self, pasos: int, frecuencia: int):
-    # TODO: Add your motor control code here
-    # Example: stepper.move(steps=pasos, frequency=frecuencia)
-    pass
-
-def jog_motor(self, frecuencia: int):
-    # TODO: Add your jog implementation
-    # Example: stepper.jog(frequency=frecuencia)
-    pass
-
-def stop_motor(self):
-    # TODO: Add your stop implementation
-    # Example: stepper.stop()
-    pass
-
-def get_position(self) -> int:
-    # TODO: Return actual position from encoder/stepper
-    # Example: return stepper.get_position()
-    return 0
-```
+---
 
 ## Troubleshooting
 
-### Pi Can't Connect
+### Pi can't connect?
 
-1. Check SERVER_URL in `pi_client.py`
-2. Ensure backend is running
-3. Check firewall settings
-4. For Railway: Use `wss://` (secure WebSocket)
+1. Verify environment variable:
 
-### Frontend Shows "Pi Disconnected"
+   ```bash
+   echo $WS_URL
+   ```
 
-1. Make sure `pi_client.py` is running on your Pi
-2. Check Pi client logs for connection errors
-3. Verify backend logs show Pi connection
+2. Make sure backend is reachable:
 
-### Commands Not Working
+   ```bash
+   curl https://your-app.up.railway.app/api/health
+   ```
 
-1. Verify Pi is connected (green indicator)
-2. Check browser console for errors
-3. Check Pi client logs for received commands
-4. Ensure motor control functions are implemented
+3. Railway requires **WSS** (TLS).
 
-## Development Tips
+---
 
-- Backend logs show all WebSocket messages
-- Frontend DevTools → Network → WS shows WebSocket traffic
-- Pi client prints all received commands and responses
+### Frontend says “Pi disconnected”
 
-## Security Notes (Production)
+* Check Pi logs
+* Check Railway WebSocket logs
+* Ensure correct WS_URL
 
-For production use, add:
+---
 
-1. Authentication (API keys, JWT tokens)
-2. Rate limiting
-3. Input validation
-4. HTTPS/WSS only
-5. CORS restrictions
+## Security Recommendations
+
+* Use HTTPS/WSS only
+* Restrict CORS
+* Require API keys or authentication
+* Validate all command inputs
+
+---
 
 ## License
 
 MIT
 
+---
+
 ## Author
 
-Built for Raspberry Pi motor control PoC
+Built for Raspberry Pi motor control PoC.
+
+---
